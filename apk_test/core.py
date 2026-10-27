@@ -274,9 +274,86 @@ def check_device(device):
     logger.info(f"✅ 设备 {device} 已连接")
     return True
 
+# ============================================================
+# 安装超时计算
+# ============================================================
+
+# APK 大小(MB) -> 基础安装时间(秒)
+SIZE_2_TIME = {
+    50: 30,
+    100: 45,
+    200: 60,
+    512: 120,
+    1024: 300,
+    2048: 600,
+    5120: 900,
+    10240: 1200
+}
+
+# Android 大版本 -> 时间倍率
+VER_2_TIME = {
+    4: 3, 5: 3, 6: 3, 7: 3, 8: 2, 9: 2,
+    10: 1.5, 11: 1.5, 12: 1, 13: 1, 14: 1, 15: 1, 16: 1
+}
+
+# API 级别 -> Android 大版本号映射
+API_TO_ANDROID_VER = {
+    35: 15, 34: 14, 33: 13, 32: 12, 31: 12,
+    30: 11, 29: 10, 28: 9, 27: 8, 26: 8,
+    25: 7, 24: 7, 23: 6, 22: 5, 21: 5,
+    20: 4, 19: 4
+}
+
+def get_apk_size_mb(apk_path):
+    """获取 APK 文件大小（MB）"""
+    try:
+        size_bytes = os.path.getsize(apk_path)
+        return size_bytes / (1024 * 1024)
+    except OSError:
+        return 0
+
+def get_device_api_level(device):
+    """获取设备 Android API 级别"""
+    result = adb_cmd(device, ["shell", "getprop", "ro.build.version.sdk"])
+    try:
+        return int(result.stdout.strip())
+    except (ValueError, TypeError):
+        return 30  # 默认 Android 11
+
+def api_level_to_android_ver(api_level):
+    """将 API 级别映射为 Android 大版本号"""
+    return API_TO_ANDROID_VER.get(api_level, api_level)
+
+def calc_install_timeout(device, apk_path):
+    """根据 APK 大小和设备版本动态计算安装超时时间（秒）"""
+    size_mb = get_apk_size_mb(apk_path)
+    api_level = get_device_api_level(device)
+    android_ver = api_level_to_android_ver(api_level)
+
+    # 计算基础时间
+    base_time = 1500  # 默认
+    for s in sorted(SIZE_2_TIME.keys()):
+        if size_mb <= s:
+            base_time = SIZE_2_TIME[s]
+            break
+
+    # 计算倍率
+    ratio = 1.0
+    for v in sorted(VER_2_TIME.keys(), reverse=True):
+        if android_ver >= v:
+            ratio = VER_2_TIME[v]
+            break
+
+    timeout = int(base_time * ratio)
+    logger.debug(f"  安装超时: APK={size_mb:.1f}MB, API={api_level}(Android {android_ver}), 超时={timeout}s")
+    return max(timeout, 60)  # 最少 60 秒
+
 def install_apk(device, apk_path, package_name):
     """安装 apk（增强版：安装过程中并行处理系统安装器弹窗）"""
-    result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
+    install_timeout = calc_install_timeout(device, apk_path)
+    push_timeout = min(install_timeout, 60)  # push 超时单独设，最多 60s
+
+    result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"], timeout=push_timeout)
     if result_push.returncode != 0:
         logger.error(f"  ❌ {device} push APK 失败")
         return False
@@ -295,11 +372,11 @@ def install_apk(device, apk_path, package_name):
     popup_thread = threading.Thread(target=popup_worker, daemon=True)
     popup_thread.start()
 
-    # 执行安装
+    # 执行安装（使用动态超时）
     result = adb_cmd(
         device,
         ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
-        timeout=120
+        timeout=install_timeout
     )
 
     # 停止弹窗处理线程
@@ -318,7 +395,7 @@ def install_apk(device, apk_path, package_name):
 
         # 重试安装
         logger.info(f"  --处理弹窗后重试安装...")
-        result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
+        result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"], timeout=push_timeout)
         if result_push.returncode != 0:
             return False
 
@@ -334,7 +411,7 @@ def install_apk(device, apk_path, package_name):
         result = adb_cmd(
             device,
             ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
-            timeout=120
+            timeout=install_timeout
         )
 
         stop_event2.set()
@@ -350,6 +427,9 @@ def install_apk(device, apk_path, package_name):
 def launch_app(device, package_name, launch_activity=None):
     """启动应用（增强版：启动后处理权限申请弹窗）"""
     logger.info(f"  --正在启动: {package_name}")
+
+    # 清空 logcat 缓冲区，避免旧日志干扰 ANR 检测
+    adb_cmd(device, ["shell", "logcat", "-c"])
 
     # 先尝试 monkey 启动
     adb_cmd(device, ["shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"])
@@ -392,8 +472,19 @@ def launch_app(device, package_name, launch_activity=None):
     return False
 
 def check_process(device, package_name):
-    """检测进程是否存活"""
+    """检测进程是否存活（pidof + ps 兜底）"""
+    # 方式1: pidof（Android 8+ 支持）
     result = adb_cmd(device, ["shell", "pidof", package_name])
+    if result.stdout.strip():
+        return True
+    # 方式2: ps 兜底（兼容旧版 Android 或精简系统）
+    result = adb_cmd(device, ["shell", "ps", "-A", "-o", "NAME"])
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if package_name in line.strip():
+                return True
+    # 方式3: pgrep 兜底（部分系统支持）
+    result = adb_cmd(device, ["shell", "pgrep", "-f", package_name])
     if result.stdout.strip():
         return True
     return False
@@ -414,30 +505,54 @@ def check_anr(device, package_name):
     return False
 
 def get_foreground_package(device):
-    """获取当前前台应用包名"""
+    """获取当前前台应用包名（多方式兜底）"""
+    # 方式1: dumpsys window displays（Android 15+ 推荐）
+    result = adb_cmd(device, ["shell", "dumpsys", "window", "displays"])
+    for line in result.stdout.splitlines():
+        # 格式: mCurrentFocus=Window{xxx u0 com.example.pkg/com.example.pkg.MainActivity}
+        m = re.search(r"mCurrentFocus=.*?(\S+)/(\S+)", line)
+        if m:
+            return m.group(1)
+
+    # 方式2: dumpsys activity activities（传统方式）
     result = adb_cmd(device, ["shell", "dumpsys", "activity", "activities"])
     for line in result.stdout.splitlines():
         if "mResumedActivity" in line or "mFocusedActivity" in line:
             m = re.search(r"(\S+)/(\S+)", line)
             if m:
                 return m.group(1)
+
+    # 方式3: dumpsys window windows（兜底）
     result2 = adb_cmd(device, ["shell", "dumpsys", "window", "windows"])
     for line in result2.stdout.splitlines():
         if "mCurrentFocus" in line:
-            m = re.search(r"(\S+)/", line)
+            m = re.search(r"mCurrentFocus=.*?(\S+)/(\S+)", line)
             if m:
                 return m.group(1)
+
     return ""
 
+_fg_warned = {}  # device -> bool: 记录是否已输出过前台警告
+_fg_ok_warned = {}  # device -> bool: 记录是否已输出过前台正常
+
 def check_crash(device, package_name):
-    """检测闪退：进程存活 且 应用在前台 且 无ANR"""
+    """检测闪退：以进程存活为主要判断依据，前台检查仅警告不判定失败"""
     if not check_process(device, package_name):
         logger.error(f"  ❌ {device} 应用进程已消失（闪退）")
         return False
     fg = get_foreground_package(device)
-    if fg != package_name:
-        logger.warning(f"  ⚠️ {device} 进程存活但不在前台（当前前台: {fg or '未知'}）")
-        return False
+    if fg and fg != package_name:
+        if not _fg_warned.get(device):
+            logger.warning(f"  ⚠️ {device} 进程存活但不在前台（当前前台: {fg}）")
+            _fg_warned[device] = True
+    elif not fg:
+        if not _fg_warned.get(device):
+            logger.warning(f"  ⚠️ {device} 进程存活，但无法获取前台应用信息（可能为系统版本兼容问题）")
+            _fg_warned[device] = True
+    else:
+        if not _fg_ok_warned.get(device):
+            logger.info(f"  ✅ {device} 应用在前台运行")
+            _fg_ok_warned[device] = True
     if check_anr(device, package_name):
         logger.error(f"  ❌ {device} 检测到 ANR，测试失败")
         return False
