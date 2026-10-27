@@ -133,6 +133,7 @@ def cmd_run(args):
     logger.info(f"  杀进程重启: {args.relaunch} 次")
     logger.info(f"  跳过安装: {args.skip_install}")
     logger.info(f"  跳过卸载: {args.skip_uninstall}")
+    logger.info(f"  SDK Enable: {args.enable or '不设置'}")
     logger.info("=" * 50)
 
     if len(apk_paths) == 1:
@@ -154,6 +155,7 @@ def cmd_run(args):
             max_workers=args.parallel,
             log_dir=apk_log_dir,
             apk_name=apk_name,
+            enable_set=args.enable,
         )
 
         # 汇总结果
@@ -181,6 +183,7 @@ def cmd_run(args):
             skip_uninstall=args.skip_uninstall,
             max_workers=args.parallel,
             log_dir=base_log_dir,
+            enable_set=args.enable,
         )
 
         # 统计最终结果
@@ -238,6 +241,9 @@ def main():
                             help="跳过安装步骤（应用已安装时使用）")
     run_parser.add_argument("--skip-uninstall", action="store_true",
                             help="跳过卸载步骤")
+    run_parser.add_argument("--enable", default=None,
+                            choices=['sdk', 'shell', 'all_1', 'official', 'perf_68'],
+                            help="设置 SDK enable 开关（安装后、启动前写入设备），可选: sdk / shell / all_1 / official / perf_68")
 
     # devices 子命令
     subparsers.add_parser("devices", help="列出已连接的设备")

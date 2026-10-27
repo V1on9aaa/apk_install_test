@@ -651,9 +651,21 @@ def uninstall_apk(device, package_name):
         logger.warning(f"  ⚠️ {device} 卸载失败（可能已卸载）: {result.stdout}")
         return False
 
-def pull_sdk_log(device, save_dir):
-    """从设备拉取 /sdcard/sdk/log.log 到本地"""
+def pull_sdk_log(device, save_dir, pkg_name=None):
+    """从设备拉取 SDK 日志到本地（带路径回退）"""
     local_path = os.path.join(save_dir, f"{device}_sdk_log.log")
+
+    # 高版本路径优先
+    if pkg_name:
+        high_path = f"/sdcard/Android/data/{pkg_name}/files/log.log"
+        result = adb_cmd(device, ["shell", "cat", high_path])
+        if result.returncode == 0 and result.stdout.strip():
+            with open(local_path, 'w', encoding='utf-8') as f:
+                f.write(result.stdout)
+            logger.info(f"  ✅ {device} SDK日志已保存（高版本路径）: {local_path}")
+            return True
+
+    # 回退到低版本路径
     result = adb_cmd(device, ["pull", "/sdcard/sdk/log.log", local_path])
     if result.returncode == 0 and os.path.exists(local_path):
         logger.info(f"  ✅ {device} SDK日志已保存: {local_path}")
@@ -662,10 +674,119 @@ def pull_sdk_log(device, save_dir):
         logger.warning(f"  ⚠️ {device} 未找到 /sdcard/sdk/log.log（可能未生成）")
         return False
 
+
+# ============================================================
+# Enable 设置
+# ============================================================
+
+# 5 种预设 enable 值
+ENABLE_TYPES = {
+    'sdk':      '0000000000000000090900009000000000000',
+    'shell':    '0000000000000000090910009000000000000',
+    'all_1':    '1111111111111111111111111111111111111111111',
+    'official': '0000000000000000090000009000000000000',
+    'perf_68':  '000000000000000009009000000000000000000000000000000000000000000000009',
+}
+
+
+def set_sdk_enable(device, pkg_name, enable_set='sdk'):
+    """
+    设置 SDK enable 开关到设备
+
+    参数:
+        device: 设备序列号
+        pkg_name: SDK 包名（高版本路径需要）
+        enable_set: 预设类型，可选: sdk / shell / all_1 / official / perf_68
+    """
+    if enable_set not in ENABLE_TYPES:
+        logger.error(f"  ❌ {device} 未知的 enable 类型: '{enable_set}'，可选: {list(ENABLE_TYPES.keys())}")
+        return False
+
+    enable_value = ENABLE_TYPES[enable_set]
+    logger.info(f"  --设置 enable: type={enable_set}, value={enable_value}")
+
+    # 获取 Android API 级别
+    api_level = get_device_api_level(device)
+    logger.info(f"  --设备 API 级别: {api_level}")
+
+    try:
+        if api_level >= 28:
+            # Android 9+：高版本路径，需要 su
+            logger.info(f"  --Android 9+，写入高版本路径: /sdcard/Android/data/{pkg_name}/files/enable.log")
+
+            # 先检查是否有 root 权限
+            su_check = adb_cmd(device, ["shell", "su", "-c", "id"])
+            has_root = su_check.returncode == 0
+
+            if has_root:
+                # 有 root，使用 su 写入高版本路径
+                commands = [
+                    f"su -c 'mkdir -p /sdcard/Android/data/{pkg_name}/files'",
+                    f"su -c 'echo {enable_value} > /sdcard/Android/data/{pkg_name}/files/enable.log'",
+                    f"su -c 'cp /sdcard/sdk/enable.dat /sdcard/Android/data/{pkg_name}/files/enable.dat 2>/dev/null; true'",
+                ]
+                all_ok = True
+                for cmd in commands:
+                    result = adb_cmd(device, ["shell", cmd])
+                    if result.returncode != 0:
+                        logger.warning(f"    ⚠️ 命令执行失败: {cmd}")
+                        all_ok = False
+
+                if all_ok:
+                    # 验证
+                    verify = adb_cmd(device, ["shell", "su", "-c", f"cat /sdcard/Android/data/{pkg_name}/files/enable.log"])
+                    if verify.returncode == 0 and verify.stdout.strip() == enable_value:
+                        logger.info(f"  ✅ {device} enable 设置成功（高版本路径）")
+                        return True
+
+                logger.warning(f"  ⚠️ {device} 高版本路径写入失败，尝试低版本路径兜底...")
+            else:
+                logger.warning(f"  ⚠️ {device} 无 root 权限，跳过高版本路径，直接使用低版本路径...")
+
+            # 兜底：尝试低版本路径
+            adb_cmd(device, ["shell", "mkdir", "-p", "/sdcard/sdk"])
+            # 使用 echo 写入（低版本路径不需要 root）
+            result = adb_cmd(device, ["shell", f"echo {enable_value} > /sdcard/sdk/enable.log"])
+            if result.returncode == 0:
+                # 验证
+                verify = adb_cmd(device, ["shell", "cat", "/sdcard/sdk/enable.log"])
+                if verify.stdout.strip() == enable_value:
+                    logger.info(f"  ✅ {device} enable 设置成功（低版本路径兜底）")
+                    return True
+                else:
+                    logger.warning(f"  ⚠️ {device} enable 写入但内容不匹配: '{verify.stdout.strip()}'")
+                    return False
+            else:
+                logger.error(f"  ❌ {device} enable 写入失败")
+                return False
+
+        else:
+            # Android 8-：低版本路径
+            logger.info(f"  --Android 8-，写入低版本路径: /sdcard/sdk/enable.log")
+            adb_cmd(device, ["shell", "mkdir", "-p", "/sdcard/sdk"])
+            result = adb_cmd(device, ["shell", f"echo {enable_value} > /sdcard/sdk/enable.log"])
+            if result.returncode == 0:
+                # 验证
+                verify = adb_cmd(device, ["shell", "cat", "/sdcard/sdk/enable.log"])
+                if verify.stdout.strip() == enable_value:
+                    logger.info(f"  ✅ {device} enable 设置成功（低版本路径）")
+                    return True
+                else:
+                    logger.warning(f"  ⚠️ {device} enable 写入但内容不匹配: '{verify.stdout.strip()}'")
+                    return False
+            else:
+                logger.error(f"  ❌ {device} enable 写入失败")
+                return False
+
+    except Exception as e:
+        logger.error(f"  ❌ {device} 设置 enable 异常: {e}")
+        return False
+
+
 def test_device(device, apk_path, package_name, launch_activity=None,
                 run_minutes=5, switch_times=2, relaunch_times=3,
                 skip_install=False, skip_uninstall=False, log_dir=None,
-                apk_name=None):
+                apk_name=None, enable_set=None):
     """单设备完整测试流程"""
     logger.info(f"\n{'='*40}\n开始测试设备: {device}\n{'='*40}")
 
@@ -674,36 +795,46 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 
     if not skip_install:
         if not install_apk(device, apk_path, package_name):
+            pull_sdk_log(device, log_dir or os.getcwd(), package_name)
             return False
     else:
         logger.info(f"  --跳过安装步骤")
 
+    # 设置 SDK enable 开关（安装后、启动前）
+    if enable_set:
+        set_sdk_enable(device, package_name, enable_set)
+
     if not launch_app(device, package_name, launch_activity):
+        pull_sdk_log(device, log_dir or os.getcwd(), package_name)
         if not skip_uninstall:
             uninstall_apk(device, package_name)
         return False
 
     if not wait_and_monitor(device, package_name, minutes=run_minutes):
         logger.error(f"❌ {device} 测试失败：运行期间闪退")
+        pull_sdk_log(device, log_dir or os.getcwd(), package_name)
         if not skip_uninstall:
             uninstall_apk(device, package_name)
         return False
 
     if not switch_background_foreground(device, package_name, times=switch_times):
         logger.error(f"❌ {device} 测试失败：前后台切换异常")
+        pull_sdk_log(device, log_dir or os.getcwd(), package_name)
         if not skip_uninstall:
             uninstall_apk(device, package_name)
         return False
 
     if not kill_and_relaunch(device, package_name, launch_activity, times=relaunch_times):
         logger.error(f"❌ {device} 测试失败：杀进程重启异常")
+        # 测试失败也拉取日志
+        pull_sdk_log(device, log_dir or os.getcwd(), package_name)
         if not skip_uninstall:
             uninstall_apk(device, package_name)
         return False
 
     logger.info(f"✅ {device} 全部测试通过")
-    # 测试全部通过后，拉取 SDK 日志到 APK 子文件夹
-    pull_sdk_log(device, log_dir or os.getcwd())
+    # 测试通过后拉取 SDK 日志
+    pull_sdk_log(device, log_dir or os.getcwd(), package_name)
     if not skip_uninstall:
         uninstall_apk(device, package_name)
     return True
@@ -711,7 +842,8 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 def run_tests(devices, apk_path, package_name=None, launch_activity=None,
               run_minutes=5, switch_times=2, relaunch_times=3,
               skip_install=False, skip_uninstall=False,
-              max_workers=None, log_dir=None, apk_name=None):
+              max_workers=None, log_dir=None, apk_name=None,
+              enable_set=None):
     """多设备并行测试入口"""
     # 解析包名
     if not package_name:
@@ -739,7 +871,7 @@ def run_tests(devices, apk_path, package_name=None, launch_activity=None,
             executor.submit(
                 test_device, device, apk_path, package_name, launch_activity,
                 run_minutes, switch_times, relaunch_times,
-                skip_install, skip_uninstall, log_dir, apk_name
+                skip_install, skip_uninstall, log_dir, apk_name, enable_set
             ): device for device in devices
         }
         for future in as_completed(future_map):
@@ -754,7 +886,7 @@ def run_tests(devices, apk_path, package_name=None, launch_activity=None,
 
 def run_tests_batch(devices, apk_paths, run_minutes=5, switch_times=2,
                     relaunch_times=3, skip_install=False, skip_uninstall=False,
-                    max_workers=None, log_dir=None):
+                    max_workers=None, log_dir=None, enable_set=None):
     """
     批量测试多个 APK（支持单 APK 或文件夹内所有 APK）
 
@@ -797,6 +929,7 @@ def run_tests_batch(devices, apk_paths, run_minutes=5, switch_times=2,
             max_workers=max_workers,
             log_dir=apk_log_dir,
             apk_name=apk_name,
+            enable_set=enable_set,
         )
         all_results[apk_path] = results
 
