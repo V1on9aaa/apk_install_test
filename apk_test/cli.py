@@ -26,8 +26,7 @@ def setup_logging(log_dir, log_level=logging.INFO):
     logger.setLevel(log_level)
 
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"apk_test_{timestamp}.log")
+    log_file = os.path.join(log_dir, "apk_test.log")
 
     # 文件 handler
     fh = logging.FileHandler(log_file, encoding="utf-8")
@@ -114,9 +113,15 @@ def cmd_run(args):
         print("❌ 请指定至少一个设备")
         return 1
 
-    # 设置日志
-    log_dir = args.log_dir or os.path.dirname(apk_paths[0])
-    log_file = setup_logging(log_dir)
+    # 创建时间戳文件夹作为本次测试的根日志目录
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base_log_dir = os.path.join(
+        args.log_dir or os.path.dirname(apk_paths[0]),
+        "log",
+        timestamp
+    )
+    log_file = setup_logging(base_log_dir)
+    print(f"📝 日志目录: {base_log_dir}")
     print(f"📝 日志文件: {log_file}")
 
     logger.info("=" * 50)
@@ -131,7 +136,11 @@ def cmd_run(args):
     logger.info("=" * 50)
 
     if len(apk_paths) == 1:
-        # 单 APK 模式，保持原有逻辑
+        # 单 APK 模式
+        apk_name = os.path.basename(apk_paths[0])
+        apk_log_dir = os.path.join(base_log_dir, apk_name)
+        os.makedirs(apk_log_dir, exist_ok=True)
+
         results = run_tests(
             devices=devices,
             apk_path=apk_paths[0],
@@ -143,7 +152,8 @@ def cmd_run(args):
             skip_install=args.skip_install,
             skip_uninstall=args.skip_uninstall,
             max_workers=args.parallel,
-            log_dir=log_dir,
+            log_dir=apk_log_dir,
+            apk_name=apk_name,
         )
 
         # 汇总结果
@@ -170,7 +180,7 @@ def cmd_run(args):
             skip_install=args.skip_install,
             skip_uninstall=args.skip_uninstall,
             max_workers=args.parallel,
-            log_dir=log_dir,
+            log_dir=base_log_dir,
         )
 
         # 统计最终结果

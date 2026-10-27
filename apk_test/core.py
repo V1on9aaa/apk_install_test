@@ -549,12 +549,19 @@ def pull_sdk_log(device, save_dir):
 
 def test_device(device, apk_path, package_name, launch_activity=None,
                 run_minutes=5, switch_times=2, relaunch_times=3,
-                skip_install=False, skip_uninstall=False, log_dir=None):
+                skip_install=False, skip_uninstall=False, log_dir=None,
+                apk_name=None):
     """单设备完整测试流程"""
     logger.info(f"\n{'='*40}\n开始测试设备: {device}\n{'='*40}")
 
     if not check_device(device):
         return False
+
+    # 创建 APK 子文件夹用于存放 SDK 日志
+    apk_log_dir = log_dir
+    if log_dir and apk_name:
+        apk_log_dir = os.path.join(log_dir, apk_name)
+        os.makedirs(apk_log_dir, exist_ok=True)
 
     if not skip_install:
         if not install_apk(device, apk_path, package_name):
@@ -586,8 +593,8 @@ def test_device(device, apk_path, package_name, launch_activity=None,
         return False
 
     logger.info(f"✅ {device} 全部测试通过")
-    # 测试全部通过后，拉取 SDK 日志
-    pull_sdk_log(device, log_dir or os.getcwd())
+    # 测试全部通过后，拉取 SDK 日志到 APK 子文件夹
+    pull_sdk_log(device, apk_log_dir or os.getcwd())
     if not skip_uninstall:
         uninstall_apk(device, package_name)
     return True
@@ -595,7 +602,7 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 def run_tests(devices, apk_path, package_name=None, launch_activity=None,
               run_minutes=5, switch_times=2, relaunch_times=3,
               skip_install=False, skip_uninstall=False,
-              max_workers=None, log_dir=None):
+              max_workers=None, log_dir=None, apk_name=None):
     """多设备并行测试入口"""
     # 解析包名
     if not package_name:
@@ -623,7 +630,7 @@ def run_tests(devices, apk_path, package_name=None, launch_activity=None,
             executor.submit(
                 test_device, device, apk_path, package_name, launch_activity,
                 run_minutes, switch_times, relaunch_times,
-                skip_install, skip_uninstall, log_dir
+                skip_install, skip_uninstall, log_dir, apk_name
             ): device for device in devices
         }
         for future in as_completed(future_map):
@@ -664,6 +671,12 @@ def run_tests_batch(devices, apk_paths, run_minutes=5, switch_times=2,
         logger.info(f"   路径: {apk_path}")
         logger.info(f"{'='*60}")
 
+        # 为当前 APK 创建子文件夹
+        apk_log_dir = None
+        if log_dir:
+            apk_log_dir = os.path.join(log_dir, apk_name)
+            os.makedirs(apk_log_dir, exist_ok=True)
+
         results = run_tests(
             devices=devices,
             apk_path=apk_path,
@@ -673,7 +686,8 @@ def run_tests_batch(devices, apk_paths, run_minutes=5, switch_times=2,
             skip_install=skip_install,
             skip_uninstall=skip_uninstall,
             max_workers=max_workers,
-            log_dir=log_dir,
+            log_dir=apk_log_dir,
+            apk_name=apk_name,
         )
         all_results[apk_path] = results
 
