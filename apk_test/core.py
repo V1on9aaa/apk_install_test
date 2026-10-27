@@ -7,10 +7,235 @@ import re
 import shutil
 import os
 import logging
+import threading
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger("apk_test")
 
+# ============================================================
+# 弹窗配置
+# ============================================================
+
+# 系统安装器弹窗文本（安装过程中可能出现）
+INSTALL_POPUP_TEXTS = [
+    "完成",
+    "详细情况",
+    "仍要安装",
+    "继续安装",
+    "始终允许",
+    "允许",
+    "确定",
+    "安装",
+    "允许访问一次",
+    "已了解应用的风险检测结果",
+    "更多详细",
+    "下一步",
+    "开始使用",
+    "同意",
+    "我知道了",
+]
+
+# 权限申请弹窗文本（启动后可能出现）
+PERMISSION_POPUP_TEXTS = [
+    "允许",
+    "始终允许",
+    "仅在使用中允许",
+    "确定",
+    "同意",
+    "授予",
+    "允许访问一次",
+    "我知道了",
+    "继续",
+]
+
+# 系统安装器包名列表
+INSTALL_PKG_NAMES = [
+    "com.android.packageinstaller",
+    "com.coloros.safecenter",
+    "com.oplus.appdetail",
+    "com.android.vending",
+    "com.android.systemui",
+    "com.google.android.packageinstaller",
+    "com.miui.packageinstaller",
+    "com.oneplus.packageinstaller",
+    "com.huawei.packageinstaller",
+]
+
+# 权限弹窗包名列表
+PERMISSION_PKG_NAMES = [
+    "com.android.packageinstaller",
+    "com.android.permissioncontroller",
+    "com.android.systemui",
+    "com.google.android.permissioncontroller",
+    "com.lbe.security.miui",
+    "com.coloros.safecenter",
+    "com.oneplus.permission",
+    "com.huawei.systemmanager",
+]
+
+
+# ============================================================
+# PopupHandler 弹窗处理类
+# ============================================================
+
+class PopupHandler:
+    """弹窗处理类 - 使用 uiautomator2 检测和点击弹窗"""
+
+    def __init__(self, device: str):
+        self.device = device
+        self._u2 = None
+
+    @property
+    def u2(self):
+        """延迟初始化 uiautomator2 连接"""
+        if self._u2 is None:
+            try:
+                import uiautomator2 as u2
+                self._u2 = u2.connect(self.device)
+            except ImportError:
+                logger.warning("  ⚠️ uiautomator2 未安装，弹窗处理功能不可用")
+                self._u2 = None
+            except Exception as e:
+                logger.warning(f"  ⚠️ uiautomator2 连接失败: {e}")
+                self._u2 = None
+        return self._u2
+
+    def get_ui2_texts(self) -> Dict[str, bool]:
+        """获取当前界面上所有可见文本及其是否可点击"""
+        if self.u2 is None:
+            return {}
+        try:
+            xml_str = self.u2.dump_hierarchy()
+            root = ET.fromstring(xml_str)
+            texts = {}
+            for element in root.iter():
+                clickable = element.attrib.get("clickable", "false")
+                text = element.attrib.get("text", "")
+                if text and text.strip():
+                    texts[text.strip()] = clickable == "true"
+            return texts
+        except Exception:
+            return {}
+
+    def get_foreground_package(self) -> str:
+        """获取当前前台包名"""
+        if self.u2 is None:
+            return ""
+        try:
+            return self.u2.app_current().get("package", "")
+        except Exception:
+            return ""
+
+    def click_text(self, text: str, exact: bool = True) -> bool:
+        """点击指定文本"""
+        if self.u2 is None:
+            return False
+        try:
+            if exact:
+                self.u2(text=text).click(timeout=3)
+            else:
+                self.u2(textContains=text).click(timeout=3)
+            return True
+        except Exception:
+            return False
+
+    def adb_tap(self, text: str) -> bool:
+        """通过 adb shell input tap 点击指定文本的控件（兜底方案）"""
+        if self.u2 is None:
+            return False
+        try:
+            element = self.u2(text=text)
+            bounds = element.info.get("bounds", {})
+            if bounds:
+                cx = (bounds["left"] + bounds["right"]) // 2
+                cy = (bounds["top"] + bounds["bottom"]) // 2
+                result = adb_cmd(self.device, ["shell", "input", "tap", str(cx), str(cy)])
+                return result.returncode == 0
+        except Exception:
+            return False
+        return False
+
+    def keyevent(self, keycode: str) -> bool:
+        """通过 adb shell input keyevent 模拟按键"""
+        result = adb_cmd(self.device, ["shell", "input", "keyevent", keycode])
+        return result.returncode == 0
+
+    def handle_popup_by_text(self, popup_texts: List[str]) -> bool:
+        """遍历点击弹窗文本，找到并点击第一个匹配的"""
+        ui2_texts = self.get_ui2_texts()
+        for text in popup_texts:
+            if text in ui2_texts:
+                logger.info(f"  🪟 检测到弹窗文本: '{text}'，正在点击...")
+                # 先用 uiautomator2 点击
+                if self.click_text(text):
+                    time.sleep(1)
+                    return True
+                # 如果 UI2 点击失败，用 adb tap 兜底
+                if self.adb_tap(text):
+                    time.sleep(1)
+                    return True
+        return False
+
+    def handle_popup_by_package(self, pkg_names: List[str]) -> bool:
+        """检测前台包名是否在弹窗列表中"""
+        fg_pkg = self.get_foreground_package()
+        for pkg in pkg_names:
+            if pkg in fg_pkg:
+                logger.info(f"  🪟 检测到系统弹窗包: '{fg_pkg}'")
+                return True
+        return False
+
+    def handle_install_popups(self, timeout: int = 30) -> bool:
+        """处理安装过程中的系统安装器弹窗"""
+        deadline = time.time() + timeout
+        handled = False
+        while time.time() < deadline:
+            if self.handle_popup_by_text(INSTALL_POPUP_TEXTS):
+                handled = True
+                time.sleep(1)
+                continue
+            # 检查是否还有安装器在前台
+            fg_pkg = self.get_foreground_package()
+            if not any(pkg in fg_pkg for pkg in INSTALL_PKG_NAMES):
+                break
+            time.sleep(0.5)
+        return handled
+
+    def handle_permission_popups(self, timeout: int = 30) -> bool:
+        """处理权限申请弹窗"""
+        deadline = time.time() + timeout
+        handled = False
+        while time.time() < deadline:
+            if self.handle_popup_by_text(PERMISSION_POPUP_TEXTS):
+                handled = True
+                time.sleep(1)
+                continue
+            # 检查是否还有权限弹窗包在前台
+            fg_pkg = self.get_foreground_package()
+            if not any(pkg in fg_pkg for pkg in PERMISSION_PKG_NAMES):
+                break
+            time.sleep(0.5)
+        return handled
+
+    def handle_all_popups(self, timeout: int = 10) -> bool:
+        """通用弹窗处理 - 同时处理安装和权限弹窗"""
+        deadline = time.time() + timeout
+        handled = False
+        while time.time() < deadline:
+            all_texts = INSTALL_POPUP_TEXTS + PERMISSION_POPUP_TEXTS
+            if self.handle_popup_by_text(all_texts):
+                handled = True
+                time.sleep(1)
+                continue
+            time.sleep(0.5)
+        return handled
+
+
+# ============================================================
+# 原有函数（增强版）
+# ============================================================
 
 def adb_cmd(device, args, timeout=30):
     """执行 adb 命令"""
@@ -55,36 +280,105 @@ def check_device(device):
 
 
 def install_apk(device, apk_path, package_name):
-    """安装 apk"""
+    """安装 apk（增强版：安装过程中并行处理系统安装器弹窗）"""
     result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
     if result_push.returncode != 0:
         logger.error(f"  ❌ {device} push APK 失败")
         return False
+
+    logger.info(f"  --正在安装: {apk_path}")
+
+    # 启动弹窗处理线程（并行处理安装弹窗）
+    handler = PopupHandler(device)
+    stop_event = threading.Event()
+
+    def popup_worker():
+        while not stop_event.is_set():
+            handler.handle_install_popups(timeout=5)
+            time.sleep(1)
+
+    popup_thread = threading.Thread(target=popup_worker, daemon=True)
+    popup_thread.start()
+
+    # 执行安装
     result = adb_cmd(
         device,
         ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
         timeout=120
     )
+
+    # 停止弹窗处理线程
+    stop_event.set()
+    popup_thread.join(timeout=3)
+
     adb_cmd(device, ["shell", "rm", "/data/local/tmp/temp.apk"])
+
     if result.returncode == 0 and "Success" in result.stdout:
         logger.info(f"  ✅ {device} 安装成功")
         return True
     else:
+        logger.warning(f"  ⚠️ {device} 安装可能被弹窗干扰: {result.stdout.strip()[:100]}")
+        # 再处理一次弹窗后重试
+        handler.handle_install_popups(timeout=10)
+
+        # 重试安装
+        logger.info(f"  --处理弹窗后重试安装...")
+        result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
+        if result_push.returncode != 0:
+            return False
+
+        stop_event2 = threading.Event()
+        def popup_worker2():
+            while not stop_event2.is_set():
+                handler.handle_install_popups(timeout=5)
+                time.sleep(1)
+
+        popup_thread2 = threading.Thread(target=popup_worker2, daemon=True)
+        popup_thread2.start()
+
+        result = adb_cmd(
+            device,
+            ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
+            timeout=120
+        )
+
+        stop_event2.set()
+        popup_thread2.join(timeout=3)
+
+        adb_cmd(device, ["shell", "rm", "/data/local/tmp/temp.apk"])
+        if result.returncode == 0 and "Success" in result.stdout:
+            logger.info(f"  ✅ {device} 重试安装成功")
+            return True
         logger.error(f"  ❌ {device} 安装失败: {result.stdout}")
         return False
 
 
 def launch_app(device, package_name, launch_activity=None):
-    """启动应用，带重试机制"""
+    """启动应用（增强版：启动后处理权限申请弹窗）"""
     logger.info(f"  --正在启动: {package_name}")
+
+    # 先尝试 monkey 启动
     adb_cmd(device, ["shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"])
+
+    handler = PopupHandler(device)
+
     for i in range(5):
         time.sleep(3)
+        # 处理可能出现的权限弹窗
+        handler.handle_permission_popups(timeout=5)
+        # 处理其他弹窗
+        handler.handle_all_popups(timeout=3)
+
         if check_process(device, package_name):
             time.sleep(2)
+            # 再处理一次弹窗
+            handler.handle_permission_popups(timeout=5)
+            handler.handle_all_popups(timeout=3)
             logger.info(f"  ✅ {device} 启动成功")
             return True
         logger.info(f"    ⏳ 等待启动中... ({i + 1}/5)")
+
+    # monkey 启动失败，尝试 am start
     logger.warning(f"  ⚠️ monkey 启动失败，尝试 am start...")
     if launch_activity:
         activity_name = f"{package_name}/{launch_activity}"
@@ -92,6 +386,11 @@ def launch_app(device, package_name, launch_activity=None):
         activity_name = f"{package_name}/.MainActivity"
     adb_cmd(device, ["shell", "am", "start", "-n", activity_name])
     time.sleep(5)
+
+    # 处理权限弹窗
+    handler.handle_permission_popups(timeout=8)
+    handler.handle_all_popups(timeout=5)
+
     if check_process(device, package_name):
         logger.info(f"  ✅ {device} 启动成功（am start）")
         return True
@@ -156,12 +455,24 @@ def check_crash(device, package_name):
 
 
 def wait_and_monitor(device, package_name, minutes=5, interval=5):
-    """定时检测应用运行状态"""
+    """定时检测应用运行状态（增强版：持续处理弹窗）"""
     logger.info(f"  --等待 {minutes} 分钟，每 {interval} 秒检查一次...")
+    handler = PopupHandler(device)
+
     for i in range(minutes * 60 // interval):
         time.sleep(interval)
+
+        # 持续处理可能出现的弹窗
+        handler.handle_all_popups(timeout=3)
+
         if not check_crash(device, package_name):
-            return False
+            # 检查是否是因为弹窗导致的"不在前台"
+            handler.handle_all_popups(timeout=5)
+            handler.handle_permission_popups(timeout=5)
+            # 再次检查
+            if not check_crash(device, package_name):
+                return False
+
         if (i + 1) % 12 == 0:
             logger.info(f"    {device} 已运行 {(i + 1) * interval // 60} 分钟，正常")
     logger.info(f"  ✅ {device} 运行期间无闪退")
@@ -169,13 +480,20 @@ def wait_and_monitor(device, package_name, minutes=5, interval=5):
 
 
 def switch_background_foreground(device, package_name, times=2):
-    """前后台切换测试"""
+    """前后台切换测试（增强版：切换后处理弹窗）"""
+    handler = PopupHandler(device)
+
     for i in range(times):
         logger.info(f"  --第 {i + 1} 次前后台切换")
         adb_cmd(device, ["shell", "input", "keyevent", "KEYCODE_HOME"])
         time.sleep(2)
         adb_cmd(device, ["shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"])
         time.sleep(3)
+
+        # 处理弹窗
+        handler.handle_all_popups(timeout=5)
+        handler.handle_permission_popups(timeout=5)
+
         if not check_crash(device, package_name):
             logger.error(f"  ❌ {device} 切换后应用闪退")
             return False
@@ -197,7 +515,9 @@ def force_stop_until_dead(device, package_name, max_retries=3, wait=2):
 
 
 def kill_and_relaunch(device, package_name, launch_activity=None, times=3):
-    """杀进程重启测试"""
+    """杀进程重启测试（增强版：重启后处理弹窗）"""
+    handler = PopupHandler(device)
+
     for i in range(times):
         logger.info(f"  --第 {i + 1} 次杀进程重启")
         if not force_stop_until_dead(device, package_name):
@@ -206,6 +526,11 @@ def kill_and_relaunch(device, package_name, launch_activity=None, times=3):
         adb_cmd(device, ["shell", "monkey", "-p", package_name,
                          "-c", "android.intent.category.LAUNCHER", "1"])
         time.sleep(3)
+
+        # 处理弹窗
+        handler.handle_all_popups(timeout=5)
+        handler.handle_permission_popups(timeout=5)
+
         if not check_crash(device, package_name):
             logger.error(f"  ❌ {device} 第 {i + 1} 次重启后闪退")
             return False
@@ -226,6 +551,7 @@ def uninstall_apk(device, package_name):
         logger.warning(f"  ⚠️ {device} 卸载失败（可能已卸载）: {result.stdout}")
         return False
 
+
 def pull_sdk_log(device, save_dir):
     """从设备拉取 /sdcard/sdk/log.log 到本地"""
     local_path = os.path.join(save_dir, f"{device}_sdk_log.log")
@@ -240,7 +566,7 @@ def pull_sdk_log(device, save_dir):
 
 def test_device(device, apk_path, package_name, launch_activity=None,
                 run_minutes=5, switch_times=2, relaunch_times=3,
-                skip_install=False, skip_uninstall=False,log_dir=None):
+                skip_install=False, skip_uninstall=False, log_dir=None):
     """单设备完整测试流程"""
     logger.info(f"\n{'='*40}\n开始测试设备: {device}\n{'='*40}")
 
@@ -287,7 +613,7 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 def run_tests(devices, apk_path, package_name=None, launch_activity=None,
               run_minutes=5, switch_times=2, relaunch_times=3,
               skip_install=False, skip_uninstall=False,
-              max_workers=None,log_dir=None):
+              max_workers=None, log_dir=None):
     """多设备并行测试入口"""
     # 解析包名
     if not package_name:
@@ -315,7 +641,7 @@ def run_tests(devices, apk_path, package_name=None, launch_activity=None,
             executor.submit(
                 test_device, device, apk_path, package_name, launch_activity,
                 run_minutes, switch_times, relaunch_times,
-                skip_install, skip_uninstall,log_dir
+                skip_install, skip_uninstall, log_dir
             ): device for device in devices
         }
         for future in as_completed(future_map):

@@ -6,6 +6,7 @@
 #
 # 这个在你空闲时间可以做一下
 # AI协助率控制在20%，做资料查询、架构设计、后期优化是没问题的
+# 简单demo 主要功能在core.py
 import time
 import subprocess
 import re
