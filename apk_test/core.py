@@ -140,23 +140,63 @@ class PopupHandler:
         except Exception:
             return False
 
+    def add_tap(self, text: str) -> bool:
+        """
+        通过 adb tap 点击元素坐标（UIA 失败后的兜底方案）
+        先通过 uiautomator2 获取元素 bounds，再计算中点坐标用 adb tap 点击
+        """
+        if self.u2 is None:
+            return False
+        try:
+            element = self.u2(text=text)
+            if not element.exists:
+                return False
+            bounds = element.info.get("bounds", {})
+            if not bounds or "left" not in bounds or "top" not in bounds:
+                return False
+            x = (bounds["left"] + bounds["right"]) // 2
+            y = (bounds["top"] + bounds["bottom"]) // 2
+            result = subprocess.run(
+                ["adb", "-s", self.device, "shell", "input", "tap", str(x), str(y)],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def handle_popup_by_text(self, popup_texts: List[str]) -> bool:
-        """遍历点击弹窗文本，找到并点击第一个匹配的"""
+        """遍历点击弹窗文本，找到并点击第一个匹配的（先尝试 UIA，失败后用 adb tap 兜底）"""
         ui2_texts = self.get_ui2_texts()
         for text in popup_texts:
             if text in ui2_texts:
                 logger.info(f"  🪟 检测到弹窗文本: '{text}'，正在点击...")
+                # 先尝试 UIA 点击
                 if self.click_text(text):
+                    time.sleep(1)
+                    return True
+                # UIA 点击失败，用 adb tap 兜底
+                logger.info(f"  --UIA 点击失败，尝试 adb tap 兜底...")
+                if self.add_tap(text):
                     time.sleep(1)
                     return True
         return False
 
     def handle_popup_by_package(self, pkg_names: List[str]) -> bool:
-        """检测前台包名是否在弹窗列表中"""
+        """检测前台包名是否在弹窗列表中，并尝试点击弹窗文本"""
         fg_pkg = self.get_foreground_package()
         for pkg in pkg_names:
             if pkg in fg_pkg:
                 logger.info(f"  🪟 检测到系统弹窗包: '{fg_pkg}'")
+                # 尝试点击所有可能的弹窗文本
+                all_texts = INSTALL_POPUP_TEXTS + PERMISSION_POPUP_TEXTS
+                for text in all_texts:
+                    if self.click_text(text):
+                        time.sleep(1)
+                        return True
+                    # UIA 失败，用 adb tap 兜底
+                    if self.add_tap(text):
+                        time.sleep(1)
+                        return True
                 return True
         return False
 
