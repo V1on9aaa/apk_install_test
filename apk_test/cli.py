@@ -5,6 +5,7 @@ APK 自动化测试 CLI 入口
 用法:
   apk-test run --apk path/to/app.apk --device 45a2cacc
   apk-test run --apk path/to/app.apk --device 45a2cacc,FA7831801432 --minutes 3
+  apk-test run --apk-dir ./apks --device 45a2cacc
   apk-test devices
   apk-test info --apk path/to/app.apk
 """
@@ -15,7 +16,7 @@ import time
 import logging
 
 from .core import (
-    run_tests, check_device, get_package_name_from_apk, adb_cmd, logger
+    run_tests, run_tests_batch, check_device, get_package_name_from_apk, adb_cmd, logger
 )
 
 
@@ -83,10 +84,30 @@ def cmd_info(args):
 
 def cmd_run(args):
     """执行测试"""
-    # 参数校验
-    if not os.path.isfile(args.apk):
-        print(f"❌ APK 文件不存在: {args.apk}")
-        return 1
+    # 确定 APK 路径列表
+    apk_paths = []
+    if args.apk_dir:
+        # 文件夹模式：扫描所有 .apk 文件
+        if not os.path.isdir(args.apk_dir):
+            print(f"❌ 文件夹不存在: {args.apk_dir}")
+            return 1
+        apk_paths = sorted([
+            os.path.join(args.apk_dir, f)
+            for f in os.listdir(args.apk_dir)
+            if f.lower().endswith(".apk")
+        ])
+        if not apk_paths:
+            print(f"❌ 文件夹内未找到 .apk 文件: {args.apk_dir}")
+            return 1
+        print(f"📁 从文件夹找到 {len(apk_paths)} 个 APK:")
+        for p in apk_paths:
+            print(f"   - {os.path.basename(p)}")
+    else:
+        # 单 APK 模式
+        if not os.path.isfile(args.apk):
+            print(f"❌ APK 文件不存在: {args.apk}")
+            return 1
+        apk_paths = [args.apk]
 
     devices = [d.strip() for d in args.device.split(",") if d.strip()]
     if not devices:
@@ -94,13 +115,13 @@ def cmd_run(args):
         return 1
 
     # 设置日志
-    log_dir = args.log_dir or os.path.dirname(args.apk)
+    log_dir = args.log_dir or os.path.dirname(apk_paths[0])
     log_file = setup_logging(log_dir)
     print(f"📝 日志文件: {log_file}")
 
     logger.info("=" * 50)
     logger.info("APK 自动化测试开始")
-    logger.info(f"  APK: {args.apk}")
+    logger.info(f"  APK 数量: {len(apk_paths)}")
     logger.info(f"  设备: {devices}")
     logger.info(f"  运行时长: {args.minutes} 分钟")
     logger.info(f"  前后台切换: {args.switch} 次")
@@ -109,34 +130,59 @@ def cmd_run(args):
     logger.info(f"  跳过卸载: {args.skip_uninstall}")
     logger.info("=" * 50)
 
-    results = run_tests(
-        devices=devices,
-        apk_path=args.apk,
-        package_name=args.package,
-        launch_activity=args.activity,
-        run_minutes=args.minutes,
-        switch_times=args.switch,
-        relaunch_times=args.relaunch,
-        skip_install=args.skip_install,
-        skip_uninstall=args.skip_uninstall,
-        max_workers=args.parallel,
-        log_dir=args.log_dir
-    )
+    if len(apk_paths) == 1:
+        # 单 APK 模式，保持原有逻辑
+        results = run_tests(
+            devices=devices,
+            apk_path=apk_paths[0],
+            package_name=args.package,
+            launch_activity=args.activity,
+            run_minutes=args.minutes,
+            switch_times=args.switch,
+            relaunch_times=args.relaunch,
+            skip_install=args.skip_install,
+            skip_uninstall=args.skip_uninstall,
+            max_workers=args.parallel,
+            log_dir=log_dir,
+        )
 
-    # 汇总结果
-    logger.info(f"\n{'='*50}\n测试结果汇总\n{'='*50}")
-    passed = 0
-    for device, ok in results.items():
-        status = "✅ 通过" if ok else "❌ 失败"
-        logger.info(f"  {device}: {status}")
-        if ok:
-            passed += 1
-    logger.info(f"{'-'*50}")
-    logger.info(f"  总计: {passed}/{len(results)} 台通过")
-    logger.info(f"{'='*50}")
+        # 汇总结果
+        logger.info(f"\n{'='*50}\n测试结果汇总\n{'='*50}")
+        passed = 0
+        for device, ok in results.items():
+            status = "✅ 通过" if ok else "❌ 失败"
+            logger.info(f"  {device}: {status}")
+            if ok:
+                passed += 1
+        logger.info(f"{'-'*50}")
+        logger.info(f"  总计: {passed}/{len(results)} 台通过")
+        logger.info(f"{'='*50}")
 
-    # 返回码：全部通过返回 0，否则返回 1
-    return 0 if passed == len(results) else 1
+        return 0 if passed == len(results) else 1
+    else:
+        # 批量模式
+        results = run_tests_batch(
+            devices=devices,
+            apk_paths=apk_paths,
+            run_minutes=args.minutes,
+            switch_times=args.switch,
+            relaunch_times=args.relaunch,
+            skip_install=args.skip_install,
+            skip_uninstall=args.skip_uninstall,
+            max_workers=args.parallel,
+            log_dir=log_dir,
+        )
+
+        # 统计最终结果
+        total_passed = 0
+        total_tests = 0
+        for apk_path, device_results in results.items():
+            for ok in device_results.values():
+                total_tests += 1
+                if ok:
+                    total_passed += 1
+
+        return 0 if total_passed == total_tests else 1
 
 
 def main():
@@ -147,6 +193,7 @@ def main():
 使用示例:
   %(prog)s run --apk app.apk --device 45a2cacc
   %(prog)s run --apk app.apk --device 45a2cacc,FA7831801432 --minutes 3
+  %(prog)s run --apk-dir ./apks --device 45a2cacc
   %(prog)s run --apk app.apk --device 45a2cacc --skip-install --skip-uninstall
   %(prog)s devices
   %(prog)s info --apk app.apk
@@ -157,7 +204,9 @@ def main():
 
     # run 子命令
     run_parser = subparsers.add_parser("run", help="执行完整测试流程")
-    run_parser.add_argument("--apk", required=True, help="APK 文件路径")
+    run_parser.add_argument("--apk", default=None, help="APK 文件路径（与 --apk-dir 二选一）")
+    run_parser.add_argument("--apk-dir", default=None,
+                            help="APK 文件夹路径，自动扫描所有 .apk 文件（与 --apk 二选一）")
     run_parser.add_argument("--device", "-d", required=True,
                             help="设备序列号，多个用逗号分隔，如: 45a2cacc,FA7831801432")
     run_parser.add_argument("--package", "-p", default=None,
@@ -190,6 +239,13 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
+        # 校验：--apk 和 --apk-dir 二选一
+        if not args.apk and not args.apk_dir:
+            print("❌ 请指定 --apk（单文件）或 --apk-dir（文件夹）")
+            return 1
+        if args.apk and args.apk_dir:
+            print("❌ --apk 和 --apk-dir 不能同时使用，请二选一")
+            return 1
         return cmd_run(args)
     elif args.command == "devices":
         return cmd_devices(args)

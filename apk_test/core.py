@@ -7,10 +7,9 @@ import re
 import shutil
 import os
 import logging
-import threading
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Tuple
 
 logger = logging.getLogger("apk_test")
 
@@ -77,7 +76,7 @@ PERMISSION_PKG_NAMES = [
 
 
 # ============================================================
-# PopupHandler 弹窗处理类
+# 弹窗处理模块
 # ============================================================
 
 class PopupHandler:
@@ -141,39 +140,13 @@ class PopupHandler:
         except Exception:
             return False
 
-    def adb_tap(self, text: str) -> bool:
-        """通过 adb shell input tap 点击指定文本的控件（兜底方案）"""
-        if self.u2 is None:
-            return False
-        try:
-            element = self.u2(text=text)
-            bounds = element.info.get("bounds", {})
-            if bounds:
-                cx = (bounds["left"] + bounds["right"]) // 2
-                cy = (bounds["top"] + bounds["bottom"]) // 2
-                result = adb_cmd(self.device, ["shell", "input", "tap", str(cx), str(cy)])
-                return result.returncode == 0
-        except Exception:
-            return False
-        return False
-
-    def keyevent(self, keycode: str) -> bool:
-        """通过 adb shell input keyevent 模拟按键"""
-        result = adb_cmd(self.device, ["shell", "input", "keyevent", keycode])
-        return result.returncode == 0
-
     def handle_popup_by_text(self, popup_texts: List[str]) -> bool:
         """遍历点击弹窗文本，找到并点击第一个匹配的"""
         ui2_texts = self.get_ui2_texts()
         for text in popup_texts:
             if text in ui2_texts:
                 logger.info(f"  🪟 检测到弹窗文本: '{text}'，正在点击...")
-                # 先用 uiautomator2 点击
                 if self.click_text(text):
-                    time.sleep(1)
-                    return True
-                # 如果 UI2 点击失败，用 adb tap 兜底
-                if self.adb_tap(text):
                     time.sleep(1)
                     return True
         return False
@@ -224,6 +197,7 @@ class PopupHandler:
         deadline = time.time() + timeout
         handled = False
         while time.time() < deadline:
+            # 先按文本匹配
             all_texts = INSTALL_POPUP_TEXTS + PERMISSION_POPUP_TEXTS
             if self.handle_popup_by_text(all_texts):
                 handled = True
@@ -234,7 +208,7 @@ class PopupHandler:
 
 
 # ============================================================
-# 原有函数（增强版）
+# 原有核心函数（增强版）
 # ============================================================
 
 def adb_cmd(device, args, timeout=30):
@@ -280,71 +254,39 @@ def check_device(device):
 
 
 def install_apk(device, apk_path, package_name):
-    """安装 apk（增强版：安装过程中并行处理系统安装器弹窗）"""
+    """安装 apk（增强版：安装后处理系统安装器弹窗）"""
     result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
     if result_push.returncode != 0:
         logger.error(f"  ❌ {device} push APK 失败")
         return False
 
     logger.info(f"  --正在安装: {apk_path}")
-
-    # 启动弹窗处理线程（并行处理安装弹窗）
-    handler = PopupHandler(device)
-    stop_event = threading.Event()
-
-    def popup_worker():
-        while not stop_event.is_set():
-            handler.handle_install_popups(timeout=5)
-            time.sleep(1)
-
-    popup_thread = threading.Thread(target=popup_worker, daemon=True)
-    popup_thread.start()
-
-    # 执行安装
     result = adb_cmd(
         device,
         ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
         timeout=120
     )
-
-    # 停止弹窗处理线程
-    stop_event.set()
-    popup_thread.join(timeout=3)
-
     adb_cmd(device, ["shell", "rm", "/data/local/tmp/temp.apk"])
 
     if result.returncode == 0 and "Success" in result.stdout:
         logger.info(f"  ✅ {device} 安装成功")
         return True
     else:
+        # 安装失败，可能是系统安装器弹窗导致，尝试处理弹窗后重试
         logger.warning(f"  ⚠️ {device} 安装可能被弹窗干扰: {result.stdout.strip()[:100]}")
-        # 再处理一次弹窗后重试
-        handler.handle_install_popups(timeout=10)
-
+        # 尝试处理安装弹窗
+        handler = PopupHandler(device)
+        handler.handle_install_popups(timeout=15)
         # 重试安装
         logger.info(f"  --处理弹窗后重试安装...")
         result_push = adb_cmd(device, ["push", apk_path, "/data/local/tmp/temp.apk"])
         if result_push.returncode != 0:
             return False
-
-        stop_event2 = threading.Event()
-        def popup_worker2():
-            while not stop_event2.is_set():
-                handler.handle_install_popups(timeout=5)
-                time.sleep(1)
-
-        popup_thread2 = threading.Thread(target=popup_worker2, daemon=True)
-        popup_thread2.start()
-
         result = adb_cmd(
             device,
             ["shell", "pm", "install", "-r", "-d", "-g", "-t", "/data/local/tmp/temp.apk"],
             timeout=120
         )
-
-        stop_event2.set()
-        popup_thread2.join(timeout=3)
-
         adb_cmd(device, ["shell", "rm", "/data/local/tmp/temp.apk"])
         if result.returncode == 0 and "Success" in result.stdout:
             logger.info(f"  ✅ {device} 重试安装成功")
@@ -567,7 +509,7 @@ def pull_sdk_log(device, save_dir):
 def test_device(device, apk_path, package_name, launch_activity=None,
                 run_minutes=5, switch_times=2, relaunch_times=3,
                 skip_install=False, skip_uninstall=False, log_dir=None):
-    """单设备完整测试流程"""
+    """单设备完整测试流程（增强版）"""
     logger.info(f"\n{'='*40}\n开始测试设备: {device}\n{'='*40}")
 
     if not check_device(device):
@@ -653,3 +595,68 @@ def run_tests(devices, apk_path, package_name=None, launch_activity=None,
                 results[device] = False
 
     return results
+
+
+def run_tests_batch(devices, apk_paths, run_minutes=5, switch_times=2,
+                    relaunch_times=3, skip_install=False, skip_uninstall=False,
+                    max_workers=None, log_dir=None):
+    """
+    批量测试多个 APK（支持单 APK 或文件夹内所有 APK）
+
+    参数:
+        devices: 设备列表
+        apk_paths: APK 文件路径列表
+        其余参数同 run_tests
+
+    返回:
+        Dict[str, Dict[str, bool]]: {apk_path: {device: True/False, ...}, ...}
+    """
+    if not apk_paths:
+        logger.error("❌ APK 列表为空")
+        return {}
+
+    all_results = {}
+    total = len(apk_paths)
+
+    for idx, apk_path in enumerate(apk_paths, 1):
+        apk_name = os.path.basename(apk_path)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📦 测试 APK [{idx}/{total}]: {apk_name}")
+        logger.info(f"   路径: {apk_path}")
+        logger.info(f"{'='*60}")
+
+        results = run_tests(
+            devices=devices,
+            apk_path=apk_path,
+            run_minutes=run_minutes,
+            switch_times=switch_times,
+            relaunch_times=relaunch_times,
+            skip_install=skip_install,
+            skip_uninstall=skip_uninstall,
+            max_workers=max_workers,
+            log_dir=log_dir,
+        )
+        all_results[apk_path] = results
+
+        # 汇总当前 APK 结果
+        passed = sum(1 for v in results.values() if v)
+        logger.info(f"\n  📊 {apk_name} 结果: {passed}/{len(results)} 台通过")
+
+    # 最终汇总
+    logger.info(f"\n{'='*60}")
+    logger.info("📊 全部 APK 测试汇总")
+    logger.info(f"{'='*60}")
+    total_passed = 0
+    total_devices = 0
+    for apk_path, results in all_results.items():
+        apk_name = os.path.basename(apk_path)
+        passed = sum(1 for v in results.values() if v)
+        total_passed += passed
+        total_devices += len(results)
+        status = "✅" if passed == len(results) else "⚠️"
+        logger.info(f"  {status} {apk_name}: {passed}/{len(results)} 台通过")
+    logger.info(f"{'-'*60}")
+    logger.info(f"  总计: {total_passed}/{total_devices} 项测试通过")
+    logger.info(f"{'='*60}")
+
+    return all_results
