@@ -23,7 +23,7 @@ todo:
 APK_PATH = r"E:\Test\sdk\origin\Tools_c++.apk"
 PACKAGE_NAME = "" # 自动解析
 DEVICE_LIST = ["45a2cacc","FA7831801432"]
-LOG_DIR = r"C:\Users\v_yuhonyu\Desktop"   # 日志输出目录
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")   # 日志输出目录
 
 logger = logging.getLogger("auto_test")
 log_file_path = None
@@ -69,6 +69,16 @@ def print_and_log(level, msg):
     print(msg)
     logger.log(level, msg)
 
+def pull_sdk_log(device, save_dir):
+    """从设备拉取 /sdcard/sdk/log.log 到本地"""
+    local_path = os.path.join(save_dir, f"{device}_sdk_log.log")
+    result = adb_cmd(device, ["pull", "/sdcard/sdk/log.log", local_path])
+    if result.returncode == 0 and os.path.exists(local_path):
+        print_and_log(logging.INFO, f"  ✅ {device} SDK日志已保存: {local_path}")
+        return True
+    else:
+        print_and_log(logging.WARNING, f"  ⚠️ {device} 未找到 /sdcard/sdk/log.log（可能未生成）")
+        return False
 
 
 def get_package_name_from_apk(apk_path):
@@ -339,6 +349,8 @@ def test_device(device):
 
 
     print_and_log(logging.INFO, f"✅ {device} 全部测试通过")
+    # 测试全部通过后，拉取 SDK 日志
+    pull_sdk_log(device, LOG_DIR)
     # 测试结束后卸载应用
     uninstall_apk(device)
     return True
