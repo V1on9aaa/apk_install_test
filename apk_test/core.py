@@ -557,12 +557,6 @@ def test_device(device, apk_path, package_name, launch_activity=None,
     if not check_device(device):
         return False
 
-    # 创建 APK 子文件夹用于存放 SDK 日志
-    apk_log_dir = log_dir
-    if log_dir and apk_name:
-        apk_log_dir = os.path.join(log_dir, apk_name)
-        os.makedirs(apk_log_dir, exist_ok=True)
-
     if not skip_install:
         if not install_apk(device, apk_path, package_name):
             return False
@@ -594,7 +588,7 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 
     logger.info(f"✅ {device} 全部测试通过")
     # 测试全部通过后，拉取 SDK 日志到 APK 子文件夹
-    pull_sdk_log(device, apk_log_dir or os.getcwd())
+    pull_sdk_log(device, log_dir or os.getcwd())
     if not skip_uninstall:
         uninstall_apk(device, package_name)
     return True
