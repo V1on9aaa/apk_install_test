@@ -558,7 +558,8 @@ def check_crash(device, package_name):
         return False
     return True
 
-def wait_and_monitor(device, package_name, minutes=5, interval=5):
+def wait_and_monitor(device, package_name, minutes=5, interval=5,
+                     log_dir=None):
     """定时检测应用运行状态（增强版：持续处理弹窗）"""
     logger.info(f"  --等待 {minutes} 分钟，每 {interval} 秒检查一次...")
     handler = PopupHandler(device)
@@ -580,6 +581,8 @@ def wait_and_monitor(device, package_name, minutes=5, interval=5):
         if (i + 1) % 12 == 0:
             logger.info(f"    {device} 已运行 {(i + 1) * interval // 60} 分钟，正常")
     logger.info(f"  ✅ {device} 运行期间无闪退")
+    # 在应用保持前台运行的最后阶段拉取日志，确保 SDK 有足够时间生成完整日志
+    pull_sdk_log(device, log_dir or os.getcwd(), package_name)
     return True
 
 def switch_background_foreground(device, package_name, times=2):
@@ -893,7 +896,8 @@ def test_device(device, apk_path, package_name, launch_activity=None,
             uninstall_apk(device, package_name)
         return False
 
-    if not wait_and_monitor(device, package_name, minutes=run_minutes):
+    if not wait_and_monitor(device, package_name, minutes=run_minutes,
+                            log_dir=log_dir):
         logger.error(f"❌ {device} 测试失败：运行期间闪退")
         pull_sdk_log(device, log_dir or os.getcwd(), package_name)
         if not skip_uninstall:
@@ -916,8 +920,6 @@ def test_device(device, apk_path, package_name, launch_activity=None,
         return False
 
     logger.info(f"✅ {device} 全部测试通过")
-    # 测试通过后拉取 SDK 日志
-    pull_sdk_log(device, log_dir or os.getcwd(), package_name)
     if not skip_uninstall:
         uninstall_apk(device, package_name)
     return True
