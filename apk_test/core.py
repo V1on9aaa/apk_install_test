@@ -651,33 +651,119 @@ def uninstall_apk(device, package_name):
         logger.warning(f"  ⚠️ {device} 卸载失败（可能已卸载）: {result.stdout}")
         return False
 
-def pull_sdk_log(device, save_dir, pkg_name=None):
-    """从设备拉取 SDK 日志到本地（带路径回退）"""
-    local_path = os.path.join(save_dir, f"{device}_sdk_log.log")
+def _try_pull(device, remote_path, local_path):
+    """尝试 pull，成功返回 True（旧版 adb 失败时 returncode 也可能是 0，必须查输出）"""
+    if os.path.exists(local_path):
+        os.remove(local_path)  # 清掉上次残留，避免误判
+    result = adb_cmd(device, ["pull", remote_path, local_path], timeout=30)
+    out = (result.stdout or "") + (result.stderr or "")
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0 \
+            and "No such file" not in out and "does not exist" not in out:
+        return True
+    # 清理失败时可能产生的空文件
+    if os.path.exists(local_path) and os.path.getsize(local_path) == 0:
+        os.remove(local_path)
+    return False
 
-    # 高版本路径优先
-    if pkg_name:
-        high_path = f"/sdcard/Android/data/{pkg_name}/files/log.log"
-        result = adb_cmd(device, ["shell", "cat", high_path])
-        if result.returncode == 0 and result.stdout.strip():
-            with open(local_path, 'w', encoding='utf-8') as f:
-                f.write(result.stdout)
-            logger.info(f"  ✅ {device} SDK日志已保存（高版本路径）: {local_path}")
+
+def _try_read(device, remote_path, local_path):
+    """尝试 shell cat（普通 + su）读取内容写本地"""
+    result = adb_cmd(device, ["shell", f"cat {remote_path}"])
+    out = (result.stdout or "") + (result.stderr or "")
+    if result.stdout and result.stdout.strip() and "Permission denied" not in out:
+        with open(local_path, 'w', encoding='utf-8') as f:
+            f.write(result.stdout)
+        return True
+    # 无权限时用 su 读（模拟器一般自带 root）
+    result = adb_cmd(device, ["shell", f"su -c 'cat {remote_path}'"])
+    if result.stdout and result.stdout.strip():
+        with open(local_path, 'w', encoding='utf-8') as f:
+            f.write(result.stdout)
+        return True
+    return False
+
+
+def pull_sdk_log(device, save_dir, pkg_name=None):
+    """从设备拉取 SDK 日志 log.log 到本地（按 API 分界排序路径 + 多方式回退）
+
+    路径规则（2026-10-28 官方口径确认）：
+      - Android 10+（API >= 29）: /sdcard/Android/data/{被测应用自身包名}/files/log.log
+      - Android 10 以下（API < 29）: /sdcard/sdk/log.log
+      - 部分机型可能不同：主路径未命中时另一条路径兜底
+    关键纠偏：高版本路径的"{包名}"一律指被测应用自身的包名；
+    com.tencent.green.ace 只是 ACE_Tools 演示包的包名，并非固定 SDK 目录
+    （ACE_Tools 的日志落在该目录，是因为那本来就是它自己的包目录）。
+    注意：device 可能含冒号（如 127.0.0.1:5555），Windows 文件名必须先转义，
+    否则会触发 NTFS 备用数据流，导致宿主文件为 0 字节（内容进不可见的流）。
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    safe_device = device.replace(":", "_")
+    local_path = os.path.join(save_dir, f"{safe_device}_sdk_log.log")
+
+    # 按设备 API 级别决定探测顺序，另一条路径兜底（部分机型可能不同）
+    api_level = get_device_api_level(device)
+    host_dir = f"/sdcard/Android/data/{pkg_name}/files" if pkg_name else None
+    if api_level >= SDK_API_BOUNDARY:
+        candidate_dirs = ([host_dir] if host_dir else []) + ["/sdcard/sdk"]
+    else:
+        candidate_dirs = ["/sdcard/sdk"] + ([host_dir] if host_dir else [])
+    logger.info(f"  --{device} API={api_level}，优先探测: {candidate_dirs[0]}")
+
+    def _fetch_one(remote_dir):
+        """拉取 remote_dir/log.log，成功返回 True"""
+        remote_path = f"{remote_dir}/log.log"
+        # 先探测文件状态，把真实原因打出来（不静默吞错）
+        ls_result = adb_cmd(device, ["shell", f"ls -l {remote_path} 2>&1"])
+        ls_out = (ls_result.stdout or "") + (ls_result.stderr or "")
+        if "No such file" in ls_out or "not found" in ls_out:
+            logger.info(f"  --{device} 路径不存在: {remote_path}")
+            return False
+        if "Permission denied" in ls_out:
+            logger.info(f"  --{device} 路径无权限: {remote_path}，尝试 root 方式读取")
+        # 方式1: pull
+        if _try_pull(device, remote_path, local_path):
+            logger.info(f"  ✅ {device} log.log 已保存: {local_path} ({remote_path})")
+            return True
+        # 方式2: cat / su cat
+        if _try_read(device, remote_path, local_path):
+            logger.info(f"  ✅ {device} log.log 已保存: {local_path} ({remote_path}, cat方式)")
+            return True
+        return False
+
+    for remote_dir in candidate_dirs:
+        if _fetch_one(remote_dir):
             return True
 
-    # 回退到低版本路径
-    result = adb_cmd(device, ["pull", "/sdcard/sdk/log.log", local_path])
-    if result.returncode == 0 and os.path.exists(local_path):
-        logger.info(f"  ✅ {device} SDK日志已保存: {local_path}")
-        return True
-    else:
-        logger.warning(f"  ⚠️ {device} 未找到 /sdcard/sdk/log.log（可能未生成）")
-        return False
+    # 最后手段：模拟器可尝试 adb root 后重来（adbd 会重启，等 2 秒）
+    root_result = adb_cmd(device, ["root"], timeout=10)
+    root_out = (root_result.stdout or "") + (root_result.stderr or "")
+    if "cannot run as root" not in root_out and "adbd cannot" not in root_out:
+        time.sleep(2)  # adbd 重启等待
+        for remote_dir in candidate_dirs:
+            if _fetch_one(remote_dir):
+                logger.info(f"  ✅ {device} SDK日志已保存（adb root 后）: {local_path}")
+                return True
+
+    logger.warning(f"  ⚠️ {device} 所有路径均未找到 log.log（应用可能未接入SDK或日志未生成）")
+    return False
 
 
 # ============================================================
 # Enable 设置
 # ============================================================
+
+# SDK 读写路径规则（2026-10-28 官方口径确认）：
+#   Android 10+（API >= 29）: /sdcard/Android/data/{被测应用自身包名}/files
+#   Android 10 以下（API < 29）: /sdcard/sdk
+#   部分机型可能不同——按被测包实测为准
+# 已知 SDK 接入包（软件名 -> 包名）：
+#   tlog_sdk     -> com.tencent.sdk            (Sdk_Tools_*_c++_64.apk)
+#   tlog_sdk_ano -> com.tencent.sdk_ano        (ANO_Tools_*_c++_64.apk)
+#   ACE_Tools    -> com.tencent.green.ace      (ACE_Tools_*_c#.apk)
+#   ANO_Tools    -> com.tencent.green.ace.ano  (ANO_Tools_*_c#.apk)
+# 历史纠偏：com.tencent.green.ace 不是"固定 SDK 目录"，它只是 ACE_Tools
+# 演示包自己的包名；高版本路径的"{包名}"一律指被测应用自身包名
+SDK_API_BOUNDARY = 29
 
 # 5 种预设 enable 值
 ENABLE_TYPES = {
@@ -695,7 +781,9 @@ def set_sdk_enable(device, pkg_name, enable_set='sdk'):
 
     参数:
         device: 设备序列号
-        pkg_name: SDK 包名（高版本路径需要）
+        pkg_name: 被测应用自身包名。高版本路径为 /sdcard/Android/data/<pkg>/files
+                  （2026-10-28 官方确认："{包名}"指应用自身包名，
+                   com.tencent.green.ace 只是 ACE_Tools 演示包的包名，并非固定 SDK 目录）
         enable_set: 预设类型，可选: sdk / shell / all_1 / official / perf_68
     """
     if enable_set not in ENABLE_TYPES:
@@ -707,76 +795,71 @@ def set_sdk_enable(device, pkg_name, enable_set='sdk'):
 
     # 获取 Android API 级别
     api_level = get_device_api_level(device)
-    logger.info(f"  --设备 API 级别: {api_level}")
+    logger.info(f"  --设备 API 级别: {api_level}（分界: Android 10 / API {SDK_API_BOUNDARY}）")
+
+    host_dir = f"/sdcard/Android/data/{pkg_name}/files" if pkg_name else None  # 被测应用自身外部私有目录（官方确认的高版本路径）
+    low_dir = "/sdcard/sdk"  # 低版本路径（Android 10 以下）
+
+    def _write_enable(dir_path, use_root):
+        """向指定目录写入 enable.log 并读回验证"""
+        if use_root:
+            adb_cmd(device, ["shell", f"su -c 'mkdir -p {dir_path}'"])
+            result = adb_cmd(device, ["shell", f"su -c 'echo {enable_value} > {dir_path}/enable.log'"])
+            verify = adb_cmd(device, ["shell", f"su -c 'cat {dir_path}/enable.log'"])
+        else:
+            adb_cmd(device, ["shell", f"mkdir -p {dir_path} 2>/dev/null; true"])
+            result = adb_cmd(device, ["shell", f"echo {enable_value} > {dir_path}/enable.log 2>/dev/null; true"])
+            verify = adb_cmd(device, ["shell", f"cat {dir_path}/enable.log 2>/dev/null"])
+        out = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0 and verify.stdout.strip() == enable_value:
+            return True
+        logger.warning(f"    ⚠️ 写入未通过验证: {dir_path} | rc={result.returncode} out='{out.strip()[:80]}'")
+        return False
+
+    # root 能力探测（高版本目录是应用自身私有目录，普通写失败时用 root 重试）
+    su_check = adb_cmd(device, ["shell", "su", "-c", "id"])
+    has_root = su_check.returncode == 0 and "uid=0" in (su_check.stdout or "")
 
     try:
-        if api_level >= 28:
-            # Android 9+：高版本路径，需要 su
-            logger.info(f"  --Android 9+，写入高版本路径: /sdcard/Android/data/{pkg_name}/files/enable.log")
-
-            # 先检查是否有 root 权限
-            su_check = adb_cmd(device, ["shell", "su", "-c", "id"])
-            has_root = su_check.returncode == 0
-
-            if has_root:
-                # 有 root，使用 su 写入高版本路径
-                commands = [
-                    f"su -c 'mkdir -p /sdcard/Android/data/{pkg_name}/files'",
-                    f"su -c 'echo {enable_value} > /sdcard/Android/data/{pkg_name}/files/enable.log'",
-                    f"su -c 'cp /sdcard/sdk/enable.dat /sdcard/Android/data/{pkg_name}/files/enable.dat 2>/dev/null; true'",
-                ]
-                all_ok = True
-                for cmd in commands:
-                    result = adb_cmd(device, ["shell", cmd])
-                    if result.returncode != 0:
-                        logger.warning(f"    ⚠️ 命令执行失败: {cmd}")
-                        all_ok = False
-
-                if all_ok:
-                    # 验证
-                    verify = adb_cmd(device, ["shell", "su", "-c", f"cat /sdcard/Android/data/{pkg_name}/files/enable.log"])
-                    if verify.returncode == 0 and verify.stdout.strip() == enable_value:
-                        logger.info(f"  ✅ {device} enable 设置成功（高版本路径）")
-                        return True
-
-                logger.warning(f"  ⚠️ {device} 高版本路径写入失败，尝试低版本路径兜底...")
+        # root 能力补救：无 su 时尝试 adb root（部分模拟器支持）
+        if not has_root:
+            logger.warning(f"  --{device} 无 su 权限，尝试 adb root（模拟器一般支持）...")
+            root_result = adb_cmd(device, ["root"], timeout=10)
+            root_out = (root_result.stdout or "") + (root_result.stderr or "")
+            if "cannot run as root" not in root_out and "adbd cannot" not in root_out:
+                time.sleep(2)  # adbd 重启等待
+                su_check = adb_cmd(device, ["shell", "su", "-c", "id"])
+                has_root = su_check.returncode == 0 and "uid=0" in (su_check.stdout or "")
             else:
-                logger.warning(f"  ⚠️ {device} 无 root 权限，跳过高版本路径，直接使用低版本路径...")
+                logger.warning(f"  ⚠️ {device} adb root 失败")
 
-            # 兜底：尝试低版本路径
-            adb_cmd(device, ["shell", "mkdir", "-p", "/sdcard/sdk"])
-            # 使用 echo 写入（低版本路径不需要 root）
-            result = adb_cmd(device, ["shell", f"echo {enable_value} > /sdcard/sdk/enable.log"])
-            if result.returncode == 0:
-                # 验证
-                verify = adb_cmd(device, ["shell", "cat", "/sdcard/sdk/enable.log"])
-                if verify.stdout.strip() == enable_value:
-                    logger.info(f"  ✅ {device} enable 设置成功（低版本路径兜底）")
-                    return True
-                else:
-                    logger.warning(f"  ⚠️ {device} enable 写入但内容不匹配: '{verify.stdout.strip()}'")
-                    return False
-            else:
-                logger.error(f"  ❌ {device} enable 写入失败")
-                return False
-
+        # 双路径写入策略（2026-10-28 官方口径，部分机型可能不同）：
+        # 主路径与兜底路径都写，哪条读回验证通过算哪条，
+        # 最大化覆盖不同机型上 SDK 的实际读取路径
+        if api_level >= SDK_API_BOUNDARY:
+            targets = [(host_dir, "高版本路径（应用自身目录）"), (low_dir, "低版本路径")]
         else:
-            # Android 8-：低版本路径
-            logger.info(f"  --Android 8-，写入低版本路径: /sdcard/sdk/enable.log")
-            adb_cmd(device, ["shell", "mkdir", "-p", "/sdcard/sdk"])
-            result = adb_cmd(device, ["shell", f"echo {enable_value} > /sdcard/sdk/enable.log"])
-            if result.returncode == 0:
-                # 验证
-                verify = adb_cmd(device, ["shell", "cat", "/sdcard/sdk/enable.log"])
-                if verify.stdout.strip() == enable_value:
-                    logger.info(f"  ✅ {device} enable 设置成功（低版本路径）")
-                    return True
-                else:
-                    logger.warning(f"  ⚠️ {device} enable 写入但内容不匹配: '{verify.stdout.strip()}'")
-                    return False
+            targets = [(low_dir, "低版本路径"), (host_dir, "高版本路径（应用自身目录）")]
+
+        success_dirs = []
+        for dir_path, label in targets:
+            if not dir_path:
+                continue
+            ok = _write_enable(dir_path, use_root=False)
+            if not ok and has_root:
+                ok = _write_enable(dir_path, use_root=True)
+            if ok:
+                logger.info(f"  ✅ {device} enable 写入成功（{label}）: {dir_path}")
+                success_dirs.append(dir_path)
             else:
-                logger.error(f"  ❌ {device} enable 写入失败")
-                return False
+                logger.warning(f"  ⚠️ {device} enable 写入失败（{label}）: {dir_path}")
+
+        if success_dirs:
+            logger.info(f"  ✅ {device} enable 设置完成，成功路径: {success_dirs}")
+            return True
+
+        logger.error(f"  ❌ {device} enable 写入失败（所有路径均未成功）")
+        return False
 
     except Exception as e:
         logger.error(f"  ❌ {device} 设置 enable 异常: {e}")
@@ -795,7 +878,7 @@ def test_device(device, apk_path, package_name, launch_activity=None,
 
     if not skip_install:
         if not install_apk(device, apk_path, package_name):
-            pull_sdk_log(device, log_dir or os.getcwd(), package_name)
+            # 安装失败时应用从未运行，SDK 日志必然不存在，无需拉取
             return False
     else:
         logger.info(f"  --跳过安装步骤")
